@@ -17,7 +17,8 @@ Engineered specifically for **8 GB VRAM NVIDIA GPUs** (such as the **RTX 4060 La
 - **CPU DACVAE Codec Optimization:** Keeps the DACVAE audio codec and watermarker in system RAM by default (`codec_device="cpu"`), saving ~1+ GB of GPU VRAM with optional CUDA toggle and automatic CPU-codec fallback on CUDA OOM.
 - **Explicit Lifecycle & Telemetry:** One-click **Load Model to GPU** and **Unload Model (Free VRAM)** (`gc.collect()` + `torch.cuda.empty_cache()`), plus a live VRAM monitor showing both PyTorch allocated VRAM and actual free GPU VRAM.
 
-### 2. All 4 Core Irodori-TTS v4-Large Studio Modes
+### 2. All 4 Core Irodori-TTS v4-Large Studio Modes + Auto Long-Form Pipeline (>30s)
+- **Automated Long-Form Audio Pipeline (>30s):** Built into Tabs A, B, and C (`Auto Long-Form Batching (>30s)` enabled by default + `Inter-Sentence Pause (s)` slider `0.15s–0.80s`). Automatically splits >75-character / >2-sentence Japanese scripts on sentence/clause boundaries (keeping trailing Irodori-TTS prosody emojis attached), anchors speaker timbre on `Chunk[0]` for Voice Design before running `Chunks[1..N]` concurrently in VRAM-adaptive parallel batches (`synthesize_batch`), and seamlessly stitches chunks with configurable pause padding + 15 ms cosine crossfades to prevent DiT duration compression ("rap" pacing) or timbre drift.
 - **Tab A — Zero-Shot Voice Cloning & Long Reference Audio:** Upload (`.wav`, `.mp3`, `.flac`) or record via microphone, automatic 48 kHz mono resampling & silence preprocessing, long reference audio support (up to 120 s), and optional reference transcript notes.
 - **Tab B — Text-based Voice Design:** Synthesize bespoke Japanese voices purely from natural-language descriptions (gender, age, pitch, tone, speaking style) with quick-start templates.
 - **Tab C — Style-Controlled Voice Cloning:** Combine reference audio (speaker identity) with a style/emotion caption prompt simultaneously.

@@ -506,3 +506,266 @@ def _call_openai_compatible(
         raise
     except Exception as exc:
         raise ScriptGenerationError(f"OpenAI-compatible API error ({model_name}): {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Smart Japanese Long-Form Text Chunker (Sentence-Aware + Emoji-Safe + Balanced)
+# ---------------------------------------------------------------------------
+DEFAULT_LONG_FORM_CHAR_THRESHOLD = 75
+DEFAULT_LONG_FORM_MAX_SENTENCES = 2
+DEFAULT_LONG_FORM_HARD_CLAUSE_LIMIT = 95
+# Average natural Japanese speech rate (~5.6 spoken chars/sec ≈ 0.18s/char)
+_JP_SECONDS_PER_CHAR = 0.18
+
+# Build emoji regex longest-first so ZWJ/VS16 sequences (e.g. 😮‍💨, ⏸️, 🌬️) match atomically
+_KNOWN_EMOJIS_SORTED = sorted({tag.emoji for tag in IRODORI_EMOJI_TAGS}, key=len, reverse=True)
+_KNOWN_EMOJI_ALT = "|".join(re.escape(e) for e in _KNOWN_EMOJIS_SORTED)
+_GENERIC_EMOJI_SEQ = (
+    r"[\U0001F300-\U0001FAFF\u23E9-\u23FA\u2600-\u27BF]"
+    r"(?:\uFE0F|\u200D[\U0001F300-\U0001FAFF\u2600-\u27BF]\uFE0F?)*"
+)
+_ANY_EMOJI_RE = re.compile(rf"(?:{_KNOWN_EMOJI_ALT}|{_GENERIC_EMOJI_SEQ})")
+
+# Delivery/pacing prefix emojis that naturally introduce the *following* sentence when
+# placed between a preceding sentence terminator (or trailing emoji) and new Japanese text.
+_PREFIX_DELIVERY_EMOJIS = frozenset({"🐢", "⏩", "👂", "📢", "📞"})
+_PREFIX_EMOJI_ALT = "|".join(re.escape(e) for e in sorted(_PREFIX_DELIVERY_EMOJIS, key=len, reverse=True))
+_TRAILING_EMOJI_RE = re.compile(
+    rf"(?!{_PREFIX_EMOJI_ALT})(?:{_KNOWN_EMOJI_ALT}|{_GENERIC_EMOJI_SEQ})"
+)
+
+# Sentence boundary: terminal punctuation (+ optional repeated punctuation + closing brackets
+# + trailing reaction/pause emojis, stopping before a delivery prefix emoji that starts the next sentence)
+_SENTENCE_SPLIT_RE = re.compile(
+    rf"([。！？!?]+[」』）\)\"']*(?:{_TRAILING_EMOJI_RE.pattern})*)"
+)
+_CLAUSE_SPLIT_RE = re.compile(
+    rf"([、，,;；…—]+[」』）\)\"']*(?:{_ANY_EMOJI_RE.pattern})*)"
+)
+_ONLY_EMOJI_OR_PUNCT_RE = re.compile(
+    rf"^(?:{_ANY_EMOJI_RE.pattern}|[\s。！？!?、，,;；…—「」『』（）\(\)\"'])+$"
+)
+
+
+@dataclass
+class TextChunkPlan:
+    chunks: List[str]
+    is_long_form: bool
+    total_chars: int
+    sentence_count: int
+    estimated_duration_sec: float
+
+
+def strip_prosody_emojis(text: str) -> str:
+    """Remove prosody emojis while preserving clean Japanese text for reference transcripts."""
+    cleaned = _ANY_EMOJI_RE.sub("", text or "")
+    return re.sub(r"[ \t]+", " ", cleaned).strip()
+
+
+def count_spoken_chars(text: str) -> int:
+    """Count spoken characters (excluding whitespace and prosody emojis) for duration/chunk sizing."""
+    clean = strip_prosody_emojis(text)
+    clean = re.sub(r"\s+", "", clean)
+    return len(clean)
+
+
+def _split_long_sentence_on_clauses(sentence: str, max_chars: int) -> List[str]:
+    """Fallback clause splitter for ultra-long single sentences with no terminal `。！？`."""
+    if count_spoken_chars(sentence) <= max_chars:
+        return [sentence]
+
+    parts = _CLAUSE_SPLIT_RE.split(sentence)
+    clauses: List[str] = []
+    idx = 0
+    while idx < len(parts):
+        seg = parts[idx]
+        delim = parts[idx + 1] if idx + 1 < len(parts) else ""
+        combined = (seg + delim).strip()
+        if combined:
+            if _ONLY_EMOJI_OR_PUNCT_RE.match(combined) and clauses:
+                clauses[-1] = clauses[-1] + combined
+            else:
+                clauses.append(combined)
+        idx += 2
+
+    if len(clauses) <= 1:
+        return [sentence]
+
+    # Balance clauses into evenly sized pieces <= max_chars
+    total = sum(count_spoken_chars(c) for c in clauses)
+    target_k = max(2, (total + max_chars - 1) // max_chars)
+    target_len = total / float(target_k)
+
+    grouped: List[str] = []
+    buf: List[str] = []
+    buf_len = 0
+    for c in clauses:
+        c_len = count_spoken_chars(c)
+        if buf and (buf_len + c_len > max_chars or (buf_len >= target_len * 0.75 and len(grouped) < target_k - 1)):
+            grouped.append("".join(buf).strip())
+            buf = [c]
+            buf_len = c_len
+        else:
+            buf.append(c)
+            buf_len += c_len
+    if buf:
+        grouped.append("".join(buf).strip())
+    return grouped
+
+
+def split_japanese_sentences(text: str, hard_clause_limit: int = DEFAULT_LONG_FORM_HARD_CLAUSE_LIMIT) -> List[str]:
+    """
+    Split Japanese text into atomic sentences strictly on `。`, `！`, `？`, `!`, `?`, or newlines,
+    keeping trailing Irodori-TTS prosody emojis attached to their preceding sentence.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return []
+
+    sentences: List[str] = []
+    for paragraph in re.split(r"[\r\n]+", raw):
+        para = paragraph.strip()
+        if not para:
+            continue
+
+        parts = _SENTENCE_SPLIT_RE.split(para)
+        para_sents: List[str] = []
+        idx = 0
+        while idx < len(parts):
+            body = parts[idx]
+            ending = parts[idx + 1] if idx + 1 < len(parts) else ""
+            candidate = (body + ending).strip()
+            idx += 2
+            if not candidate:
+                continue
+
+            # Attach standalone trailing emojis/punctuation to the preceding sentence
+            if _ONLY_EMOJI_OR_PUNCT_RE.match(candidate) and para_sents:
+                para_sents[-1] = f"{para_sents[-1]}{candidate}"
+            else:
+                para_sents.append(candidate)
+
+        for sent in para_sents:
+            if count_spoken_chars(sent) > hard_clause_limit:
+                sentences.extend(_split_long_sentence_on_clauses(sent, max_chars=hard_clause_limit))
+            else:
+                sentences.append(sent)
+
+    return sentences
+
+
+def _balance_sentence_groups(
+    sentences: List[str],
+    max_chunk_chars: int,
+    max_sentences_per_chunk: int,
+) -> List[str]:
+    """
+    Partition ordered sentences into length-balanced chunks using exact DP to minimize
+    padding overhead during parallel GPU batch execution.
+    """
+    n = len(sentences)
+    if n <= 1:
+        return list(sentences)
+
+    lengths = [max(1, count_spoken_chars(s)) for s in sentences]
+    total_chars = sum(lengths)
+
+    # Determine minimal feasible chunk count K
+    min_chunks_by_chars = max(1, (total_chars + max_chunk_chars - 1) // max_chunk_chars)
+    min_chunks_by_sents = max(1, (n + max_sentences_per_chunk - 1) // max_sentences_per_chunk)
+    target_k = max(min_chunks_by_chars, min_chunks_by_sents)
+    ideal_len = total_chars / float(target_k)
+
+    # Prefix sums for O(1) range length lookup
+    prefix = [0] * (n + 1)
+    for i, ln in enumerate(lengths):
+        prefix[i + 1] = prefix[i] + ln
+
+    # Exact DP: dp[i] = (min_cost, prev_split_idx) for sentences[:i]
+    # Allow up to 3 tiny sentences in one chunk only if total spoken chars <= max_chunk_chars
+    soft_max_sents = max(max_sentences_per_chunk, 3)
+    inf = 1e18
+    dp_cost = [inf] * (n + 1)
+    dp_prev = [-1] * (n + 1)
+    dp_cost[0] = 0.0
+
+    for i in range(1, n + 1):
+        for j in range(max(0, i - soft_max_sents), i):
+            span_sents = i - j
+            span_chars = prefix[i] - prefix[j]
+            # Single atomic sentence is always allowed even if > max_chunk_chars
+            if span_sents > 1:
+                if span_chars > max_chunk_chars:
+                    continue
+                if span_sents > max_sentences_per_chunk and span_chars > int(max_chunk_chars * 0.85):
+                    continue
+
+            diff = span_chars - ideal_len
+            # Small extra penalty for exceeding ideal length or making ultra-short tail chunks
+            short_penalty = 200.0 if (span_chars < 15 and span_sents < n) else 0.0
+            step_cost = diff * diff + short_penalty
+            total_cost = dp_cost[j] + step_cost
+            if total_cost < dp_cost[i]:
+                dp_cost[i] = total_cost
+                dp_prev[i] = j
+
+    # Reconstruct chunks in order
+    chunks: List[str] = []
+    cur = n
+    while cur > 0:
+        prev = dp_prev[cur]
+        if prev < 0:
+            prev = cur - 1
+        chunks.append("".join(sentences[prev:cur]).strip())
+        cur = prev
+    chunks.reverse()
+    return chunks
+
+
+def chunk_japanese_text(
+    text: str,
+    max_chunk_chars: int = DEFAULT_LONG_FORM_CHAR_THRESHOLD,
+    max_sentences_per_chunk: int = DEFAULT_LONG_FORM_MAX_SENTENCES,
+    pause_sec: float = 0.30,
+) -> TextChunkPlan:
+    """
+    Analyze Japanese text and automatically split it into balanced, sentence-aligned chunks
+    when it exceeds a safe single-window DiT threshold (`> 75` spoken chars or `> 2` sentences).
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return TextChunkPlan(
+            chunks=[],
+            is_long_form=False,
+            total_chars=0,
+            sentence_count=0,
+            estimated_duration_sec=0.0,
+        )
+
+    sentences = split_japanese_sentences(raw)
+    total_chars = count_spoken_chars(raw)
+    sentence_count = len(sentences)
+
+    if total_chars <= max_chunk_chars and sentence_count <= max_sentences_per_chunk:
+        est_sec = max(1.0, total_chars * _JP_SECONDS_PER_CHAR)
+        return TextChunkPlan(
+            chunks=[raw],
+            is_long_form=False,
+            total_chars=total_chars,
+            sentence_count=max(1, sentence_count),
+            estimated_duration_sec=round(est_sec, 1),
+        )
+
+    chunks = _balance_sentence_groups(
+        sentences,
+        max_chunk_chars=max_chunk_chars,
+        max_sentences_per_chunk=max_sentences_per_chunk,
+    )
+    est_sec = total_chars * _JP_SECONDS_PER_CHAR + max(0, len(chunks) - 1) * float(pause_sec)
+    return TextChunkPlan(
+        chunks=chunks,
+        is_long_form=len(chunks) > 1,
+        total_chars=total_chars,
+        sentence_count=sentence_count,
+        estimated_duration_sec=round(est_sec, 1),
+    )

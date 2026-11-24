@@ -37,6 +37,7 @@ from text_processor import (
     OPENAI_DEFAULT_MODELS,
     ScriptGenerationError,
     analyze_japanese_text,
+    chunk_japanese_text,
     generate_japanese_script,
 )
 from tts_engine import (
@@ -427,6 +428,38 @@ def _resolve_export_sr(label: str) -> int:
     return EXPORT_SAMPLE_RATES.get(label, 48000)
 
 
+def format_long_form_feedback(
+    text: str,
+    auto_long_form: bool,
+    pause_sec: float,
+    mode: str,
+) -> str:
+    """Compact live chunk-count & estimated duration feedback near the Generate button."""
+    if not text or not text.strip():
+        return "*Enter Japanese text to estimate chunks & duration.*"
+    plan = chunk_japanese_text(text, pause_sec=float(pause_sec))
+    if plan.is_long_form:
+        if auto_long_form:
+            strategy = (
+                "Stage 1 Anchor + Parallel Style-Clone Batch"
+                if mode == "voice_design"
+                else "Parallel Multi-Chunk Batch"
+            )
+            return (
+                f"🧩 **Auto Long-Form active:** `{len(plan.chunks)}` chunks · "
+                f"`{plan.total_chars}` chars · `~{plan.estimated_duration_sec:.0f}s` est. "
+                f"*({strategy}, {float(pause_sec):.2f}s pause + 15ms crossfade)*"
+            )
+        return (
+            f"⚠️ **Long script (`{plan.total_chars}` chars, `~{plan.estimated_duration_sec:.0f}s` est.):** "
+            "Auto Long-Form Batching is OFF — single-pass >30s speech may compress pacing."
+        )
+    return (
+        f"📏 **Single-pass synthesis:** `1` chunk · `{plan.total_chars}` chars · "
+        f"`~{plan.estimated_duration_sec:.0f}s` est."
+    )
+
+
 def handle_zero_shot_clone(
     text: str,
     ref_audio: Optional[str],
@@ -441,6 +474,9 @@ def handle_zero_shot_clone(
     speed: float,
     trim_output_silence: bool,
     export_sr_label: str,
+    auto_long_form: bool,
+    inter_sentence_pause: float,
+    progress: gr.Progress = gr.Progress(),
 ) -> Tuple[Optional[str], Optional[str], str, List[List[Any]], str]:
     effective_ref = ref_audio
     if not effective_ref and preset_name and preset_name != "(None)":
@@ -463,9 +499,13 @@ def handle_zero_shot_clone(
             speed=float(speed),
             trim_output_silence=bool(trim_output_silence),
             export_sample_rate=_resolve_export_sr(export_sr_label),
+            auto_long_form=bool(auto_long_form),
+            inter_sentence_pause=float(inter_sentence_pause),
+            progress_cb=lambda frac, desc: progress(frac, desc=desc),
         )
+        lf_tag = f" | {res.long_form_info}" if res.long_form_info else ""
         status = (
-            f"**Done (Zero-Shot Cloning)** | File: `{res.output_path.name}` | "
+            f"**Done (Zero-Shot Cloning)**{lf_tag} | File: `{res.output_path.name}` | "
             f"Duration: `{res.duration_sec:.2f}s` | SR: `{res.sample_rate} Hz` | "
             f"Seed: `{res.seed_used}` | Time: `{res.elapsed_sec:.2f}s`"
         )
@@ -495,6 +535,9 @@ def handle_voice_design(
     speed: float,
     trim_output_silence: bool,
     export_sr_label: str,
+    auto_long_form: bool,
+    inter_sentence_pause: float,
+    progress: gr.Progress = gr.Progress(),
 ) -> Tuple[Optional[str], Optional[str], str, List[List[Any]], str]:
     try:
         res = ENGINE.synthesize(
@@ -508,9 +551,13 @@ def handle_voice_design(
             speed=float(speed),
             trim_output_silence=bool(trim_output_silence),
             export_sample_rate=_resolve_export_sr(export_sr_label),
+            auto_long_form=bool(auto_long_form),
+            inter_sentence_pause=float(inter_sentence_pause),
+            progress_cb=lambda frac, desc: progress(frac, desc=desc),
         )
+        lf_tag = f" | {res.long_form_info}" if res.long_form_info else ""
         status = (
-            f"**Done (Voice Design)** | File: `{res.output_path.name}` | "
+            f"**Done (Voice Design)**{lf_tag} | File: `{res.output_path.name}` | "
             f"Duration: `{res.duration_sec:.2f}s` | SR: `{res.sample_rate} Hz` | "
             f"Seed: `{res.seed_used}` | Time: `{res.elapsed_sec:.2f}s`"
         )
@@ -545,6 +592,9 @@ def handle_style_clone(
     speed: float,
     trim_output_silence: bool,
     export_sr_label: str,
+    auto_long_form: bool,
+    inter_sentence_pause: float,
+    progress: gr.Progress = gr.Progress(),
 ) -> Tuple[Optional[str], Optional[str], str, List[List[Any]], str]:
     effective_ref = ref_audio
     if not effective_ref and preset_name and preset_name != "(None)":
@@ -568,9 +618,13 @@ def handle_style_clone(
             speed=float(speed),
             trim_output_silence=bool(trim_output_silence),
             export_sample_rate=_resolve_export_sr(export_sr_label),
+            auto_long_form=bool(auto_long_form),
+            inter_sentence_pause=float(inter_sentence_pause),
+            progress_cb=lambda frac, desc: progress(frac, desc=desc),
         )
+        lf_tag = f" | {res.long_form_info}" if res.long_form_info else ""
         status = (
-            f"**Done (Style-Controlled Cloning)** | File: `{res.output_path.name}` | "
+            f"**Done (Style-Controlled Cloning)**{lf_tag} | File: `{res.output_path.name}` | "
             f"Duration: `{res.duration_sec:.2f}s` | SR: `{res.sample_rate} Hz` | "
             f"Seed: `{res.seed_used}` | Time: `{res.elapsed_sec:.2f}s`"
         )
@@ -741,6 +795,24 @@ def build_postproc_controls() -> Tuple[gr.Slider, gr.Checkbox, gr.Dropdown]:
             value="48 kHz (Native Studio WAV)",
         )
     return speed_slider, trim_chk, export_sr_dd
+
+
+def build_long_form_controls() -> Tuple[gr.Checkbox, gr.Slider]:
+    with gr.Row():
+        auto_lf_chk = gr.Checkbox(
+            label="Auto Long-Form Batching (>30s)",
+            value=True,
+            info="Auto-splits >75 chars / >2 sentences into anchored parallel chunks to prevent pacing compression.",
+        )
+        pause_slider = gr.Slider(
+            label="Inter-Sentence Pause (s)",
+            minimum=0.15,
+            maximum=0.80,
+            step=0.05,
+            value=0.30,
+            info="Silence padding + 15ms crossfade between stitched chunks",
+        )
+    return auto_lf_chk, pause_slider
 
 
 # ---------------------------------------------------------------------------
@@ -1011,7 +1083,9 @@ def create_app() -> Tuple[gr.Blocks, Any, str]:
                                 tab_a_cfg_spk = gr.Slider(label="Speaker CFG", minimum=1.0, maximum=10.0, step=0.5, value=5.0)
                                 tab_a_seed = gr.Number(label="Seed (-1 = Random)", value=-1, precision=0)
                             tab_a_speed, tab_a_trim_out, tab_a_sr = build_postproc_controls()
+                            tab_a_auto_lf, tab_a_pause = build_long_form_controls()
 
+                        tab_a_chunk_info = gr.Markdown(format_long_form_feedback("", True, 0.30, "zero_shot"))
                         tab_a_gen_btn = gr.Button("🔊 Generate Cloned Speech", variant="primary", size="lg")
 
             # -----------------------------------------------------------------
@@ -1057,7 +1131,9 @@ def create_app() -> Tuple[gr.Blocks, Any, str]:
                                 tab_b_cfg_cap = gr.Slider(label="Voice Design CFG", minimum=1.0, maximum=8.0, step=0.5, value=3.5)
                                 tab_b_seed = gr.Number(label="Seed (-1 = Random)", value=-1, precision=0)
                             tab_b_speed, tab_b_trim_out, tab_b_sr = build_postproc_controls()
+                            tab_b_auto_lf, tab_b_pause = build_long_form_controls()
 
+                        tab_b_chunk_info = gr.Markdown(format_long_form_feedback("", True, 0.30, "voice_design"))
                         tab_b_gen_btn = gr.Button("🎨 Generate Designed Voice", variant="primary", size="lg")
 
             # -----------------------------------------------------------------
@@ -1120,7 +1196,9 @@ def create_app() -> Tuple[gr.Blocks, Any, str]:
                                 tab_c_cfg_cap = gr.Slider(label="Style CFG", minimum=1.0, maximum=8.0, step=0.5, value=3.5)
                                 tab_c_seed = gr.Number(label="Seed (-1 = Random)", value=-1, precision=0)
                             tab_c_speed, tab_c_trim_out, tab_c_sr = build_postproc_controls()
+                            tab_c_auto_lf, tab_c_pause = build_long_form_controls()
 
+                        tab_c_chunk_info = gr.Markdown(format_long_form_feedback("", True, 0.30, "style_clone"))
                         tab_c_gen_btn = gr.Button("🎭 Generate Style-Controlled Clone", variant="primary", size="lg")
 
             # -----------------------------------------------------------------
@@ -1371,6 +1449,17 @@ def create_app() -> Tuple[gr.Blocks, Any, str]:
             outputs=[tab_c_ref_audio],
         )
 
+        # Live long-form chunk count & duration feedback for Tabs A, B, C
+        for txt_box, lf_chk, pause_sl, info_md, mode_name in (
+            (tab_a_text, tab_a_auto_lf, tab_a_pause, tab_a_chunk_info, "zero_shot"),
+            (tab_b_text, tab_b_auto_lf, tab_b_pause, tab_b_chunk_info, "voice_design"),
+            (tab_c_text, tab_c_auto_lf, tab_c_pause, tab_c_chunk_info, "style_clone"),
+        ):
+            _update_fn = lambda t, lf, p, m=mode_name: format_long_form_feedback(t, lf, p, m)
+            txt_box.change(fn=_update_fn, inputs=[txt_box, lf_chk, pause_sl], outputs=[info_md])
+            lf_chk.change(fn=_update_fn, inputs=[txt_box, lf_chk, pause_sl], outputs=[info_md])
+            pause_sl.change(fn=_update_fn, inputs=[txt_box, lf_chk, pause_sl], outputs=[info_md])
+
         # Core Synthesis Triggers (Tabs A, B, C, D)
         tab_a_gen_btn.click(
             fn=handle_zero_shot_clone,
@@ -1388,6 +1477,8 @@ def create_app() -> Tuple[gr.Blocks, Any, str]:
                 tab_a_speed,
                 tab_a_trim_out,
                 tab_a_sr,
+                tab_a_auto_lf,
+                tab_a_pause,
             ],
             outputs=[output_audio, output_download, output_status_md, history_df, vram_html],
         )
@@ -1404,6 +1495,8 @@ def create_app() -> Tuple[gr.Blocks, Any, str]:
                 tab_b_speed,
                 tab_b_trim_out,
                 tab_b_sr,
+                tab_b_auto_lf,
+                tab_b_pause,
             ],
             outputs=[output_audio, output_download, output_status_md, history_df, vram_html],
         )
@@ -1425,6 +1518,8 @@ def create_app() -> Tuple[gr.Blocks, Any, str]:
                 tab_c_speed,
                 tab_c_trim_out,
                 tab_c_sr,
+                tab_c_auto_lf,
+                tab_c_pause,
             ],
             outputs=[output_audio, output_download, output_status_md, history_df, vram_html],
         )

@@ -46,6 +46,8 @@ import soundfile as sf
 import torch
 from scipy import signal as scipy_signal
 
+from text_processor import chunk_japanese_text, strip_prosody_emojis
+
 try:
     import torchaudio
 except Exception:  # pragma: no cover - soundfile/scipy fallback handles audio I/O cleanly
@@ -124,6 +126,8 @@ class SynthesisResult:
     caption: str
     seed_used: int
     timestamp: str
+    num_chunks: int = 1
+    long_form_info: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +299,91 @@ def adjust_speed_wsola(audio: np.ndarray, sr: int, speed: float) -> np.ndarray:
     mask = norm > 1e-4
     out[mask] /= norm[mask]
     return np.clip(out, -1.0, 1.0).astype(np.float32)
+
+
+def stitch_audio_chunks(
+    chunks: List[np.ndarray],
+    sr: int,
+    pause_sec: float = 0.30,
+    crossfade_ms: float = 15.0,
+) -> np.ndarray:
+    """
+    Seamlessly concatenate ordered mono float32 waveforms into a single buffer:
+      - Trims excessive leading/trailing dead silence per chunk (preserving 40ms breath tail)
+      - Gently matches chunk RMS loudness toward Chunk[0] (clamped to +/- 3 dB)
+      - Applies a smooth raised-cosine `crossfade_ms` (default 15ms) envelope at every
+        splice boundary to eliminate clicks, DC jumps, and abrupt breath cuts
+      - Inserts `pause_sec` silence between chunks (or direct overlap-add if pause_sec == 0)
+    """
+    valid_chunks = [np.asarray(c, dtype=np.float32).reshape(-1) for c in chunks if c is not None and c.size > 0]
+    if not valid_chunks:
+        return np.zeros(0, dtype=np.float32)
+    if len(valid_chunks) == 1:
+        return np.clip(valid_chunks[0], -1.0, 1.0).astype(np.float32)
+
+    fade_samples = max(1, int(round(sr * (float(crossfade_ms) / 1000.0))))
+    pause_samples = max(0, int(round(sr * max(0.0, float(pause_sec)))))
+
+    # Trim dead silence per chunk and gently normalize loudness toward anchor Chunk[0]
+    cleaned: List[np.ndarray] = []
+    anchor_rms: Optional[float] = None
+    for idx, raw_chunk in enumerate(valid_chunks):
+        seg = trim_silence(raw_chunk, sr, threshold_db=-45.0, pad_ms=40.0)
+        # Remove subtle DC offset before boundary fading
+        seg = seg - float(np.mean(seg))
+        rms = float(np.sqrt(np.mean(seg * seg) + 1e-12))
+        if idx == 0:
+            anchor_rms = rms
+        elif anchor_rms is not None and rms > 1e-5:
+            # Clamp gain to [-3 dB, +3 dB] so deliberate whispers stay soft while timbre stays cohesive
+            gain = float(np.clip(anchor_rms / rms, 0.707, 1.414))
+            seg = seg * gain
+        cleaned.append(seg.astype(np.float32, copy=False))
+
+    # Raised-cosine fade curves
+    t_curve = np.linspace(0.0, math.pi, fade_samples, dtype=np.float32)
+    fade_in = 0.5 * (1.0 - np.cos(t_curve))
+    fade_out = 0.5 * (1.0 + np.cos(t_curve))
+
+    if pause_samples > 0:
+        pieces: List[np.ndarray] = []
+        silence_pad = np.zeros(pause_samples, dtype=np.float32)
+        for idx, seg in enumerate(cleaned):
+            seg = seg.copy()
+            f_len = min(fade_samples, seg.size // 4)
+            if f_len > 1:
+                if f_len == fade_samples:
+                    fi, fo = fade_in, fade_out
+                else:
+                    tc = np.linspace(0.0, math.pi, f_len, dtype=np.float32)
+                    fi = 0.5 * (1.0 - np.cos(tc))
+                    fo = 0.5 * (1.0 + np.cos(tc))
+                if idx > 0:
+                    seg[:f_len] *= fi
+                if idx < len(cleaned) - 1:
+                    seg[-f_len:] *= fo
+            pieces.append(seg)
+            if idx < len(cleaned) - 1:
+                pieces.append(silence_pad)
+        stitched = np.concatenate(pieces, axis=0)
+    else:
+        # Direct 15ms overlap-add crossfade when pause_sec == 0
+        stitched = cleaned[0].copy()
+        for seg in cleaned[1:]:
+            ov = min(fade_samples, stitched.size // 2, seg.size // 2)
+            if ov > 1:
+                tc = np.linspace(0.0, math.pi, ov, dtype=np.float32)
+                fi = 0.5 * (1.0 - np.cos(tc))
+                fo = 0.5 * (1.0 + np.cos(tc))
+                cross = stitched[-ov:] * fo + seg[:ov] * fi
+                stitched = np.concatenate([stitched[:-ov], cross, seg[ov:]], axis=0)
+            else:
+                stitched = np.concatenate([stitched, seg], axis=0)
+
+    peak = float(np.max(np.abs(stitched))) if stitched.size > 0 else 0.0
+    if peak > 0.99:
+        stitched = (stitched / peak) * 0.98
+    return np.clip(stitched, -1.0, 1.0).astype(np.float32)
 
 
 def preprocess_reference_audio(
@@ -795,12 +884,32 @@ class IrodoriTTSEngine:
 
         # Import official Irodori-TTS runtime
         try:
+            import irodori_tts.inference_runtime as _ir_mod
             from irodori_tts.inference_runtime import InferenceRuntime, RuntimeKey
         except ImportError as exc:
             raise TTSEngineError(
                 "The official `irodori_tts` package is not installed.\n"
                 "Run `setup_windows.bat` to install it into `.venv`."
             ) from exc
+
+        # Compatibility patch for torchaudio 2.10+ on Windows without torchcodec/FFmpeg:
+        # Upstream `_load_audio` only catches `RuntimeError`, whereas torchaudio 2.10 raises
+        # `ImportError` when `torchcodec` is absent. Use `soundfile` cleanly first.
+        def _safe_load_audio(path: str | Path) -> Tuple[torch.Tensor, int]:
+            try:
+                data, sr = sf.read(str(path), dtype="float32")
+                wav = torch.from_numpy(np.asarray(data, dtype=np.float32))
+                if wav.ndim == 1:
+                    wav = wav.unsqueeze(0)
+                else:
+                    wav = wav.T.contiguous()
+                return wav, int(sr)
+            except Exception:
+                if torchaudio is not None:
+                    return torchaudio.load(str(path))
+                raise
+
+        _ir_mod._load_audio = _safe_load_audio
 
         # Already loaded with the same variant and codec device?
         if (
@@ -939,6 +1048,376 @@ class IrodoriTTSEngine:
             arr = (arr / peak) * 0.98
         return arr, sr
 
+    def _choose_parallel_micro_batch_size(self, num_requests: int) -> int:
+        """
+        Choose a VRAM-safe concurrent batch size for `InferenceRuntime.synthesize_batch`
+        without triggering Windows WDDM Shared-GPU-Memory PCIe fallback.
+        Note: `independent` CFG with text+speaker+caption runs 4 CFG rows per chunk,
+        so on 8 GB GPUs (RTX 4060) `batch=2` (8 CFG rows) maximizes speed inside GDDR6.
+        """
+        if num_requests <= 1:
+            return 1
+        if not torch.cuda.is_available():
+            return min(num_requests, 2)
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+            free_mb = float(free_bytes) / (1024.0 * 1024.0)
+            total_mb = float(total_bytes) / (1024.0 * 1024.0)
+        except Exception:
+            free_mb = 2048.0
+            total_mb = 8192.0
+
+        # Protect 8-10 GB Windows WDDM GPUs from silent PCIe sysmem thrashing
+        if total_mb <= 10500.0:
+            if free_mb >= 2200.0:
+                return min(num_requests, 2)
+            return 1
+
+        # 12GB+ / 16GB+ / 24GB+ GPUs
+        if free_mb >= 7000.0:
+            return min(num_requests, 4)
+        if free_mb >= 4500.0:
+            return min(num_requests, 3)
+        if free_mb >= 2400.0:
+            return min(num_requests, 2)
+        return 1
+
+    def _run_parallel_requests_vram_safe(
+        self,
+        requests: List[Any],
+        *,
+        progress_cb: Optional[Callable[[float, str], None]] = None,
+        progress_start: float = 0.0,
+        progress_end: float = 0.90,
+        stage_label: str = "Parallel batch synthesis",
+    ) -> Tuple[List[np.ndarray], int, int]:
+        """
+        Execute a list of compatible `SamplingRequest`s concurrently using
+        `InferenceRuntime.synthesize_batch` in VRAM-adaptive micro-batches.
+        Automatically halves micro-batch size on CUDA OOM so 8GB GPUs never crash.
+        Returns `(ordered_waveforms, native_sample_rate, max_parallel_used)`.
+        """
+        total = len(requests)
+        if total == 0:
+            return [], NATIVE_SAMPLE_RATE, 0
+
+        has_native_batch = hasattr(self._runtime, "synthesize_batch")
+        batch_size = self._choose_parallel_micro_batch_size(total) if has_native_batch else 1
+        max_parallel_used = 1
+        waves: List[np.ndarray] = []
+        native_sr = NATIVE_SAMPLE_RATE
+
+        idx = 0
+        while idx < total:
+            cur_bs = min(batch_size, total - idx)
+            sub_reqs = requests[idx : idx + cur_bs]
+
+            if progress_cb is not None:
+                frac = progress_start + (progress_end - progress_start) * (idx / float(total))
+                end_num = idx + cur_bs
+                if cur_bs > 1:
+                    progress_cb(
+                        frac,
+                        f"{stage_label}: chunks {idx + 1}–{end_num}/{total} (parallel batch={cur_bs})...",
+                    )
+                else:
+                    progress_cb(frac, f"{stage_label}: chunk {idx + 1}/{total}...")
+
+            try:
+                def _step_cb(step_idx: int, total_steps: int) -> None:
+                    if progress_cb is not None and total_steps > 0:
+                        sub_span = (progress_end - progress_start) * (cur_bs / float(total))
+                        base_frac = progress_start + (progress_end - progress_start) * (idx / float(total))
+                        frac_now = base_frac + sub_span * (step_idx / float(total_steps))
+                        end_num = idx + cur_bs
+                        if cur_bs > 1:
+                            progress_cb(
+                                frac_now,
+                                f"{stage_label}: chunks {idx + 1}–{end_num}/{total} "
+                                f"(parallel batch={cur_bs}, step {step_idx}/{total_steps})...",
+                            )
+                        else:
+                            progress_cb(
+                                frac_now,
+                                f"{stage_label}: chunk {idx + 1}/{total} (step {step_idx}/{total_steps})...",
+                            )
+
+                with self._lock:
+                    with torch.inference_mode():
+                        if cur_bs > 1 and has_native_batch:
+                            raw_list = self._runtime.synthesize_batch(sub_reqs, step_callback=_step_cb)
+                        else:
+                            raw_list = [self._runtime.synthesize(sub_reqs[0], step_callback=_step_cb)]
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                max_parallel_used = max(max_parallel_used, cur_bs)
+                for raw_item in raw_list:
+                    wav, sr = self._extract_audio_and_sr(raw_item)
+                    native_sr = sr
+                    waves.append(wav)
+                idx += cur_bs
+            except torch.cuda.OutOfMemoryError as oom_err:
+                self._clear_cuda_memory()
+                if cur_bs > 1:
+                    # Gracefully step down micro-batch size and retry without crashing
+                    batch_size = max(1, cur_bs // 2)
+                    continue
+                raise TTSEngineError(
+                    "CUDA Out of Memory during long-form chunk synthesis (8GB VRAM limit reached).\n"
+                    "Actionable fixes:\n"
+                    "  1. Keep DACVAE Codec Device on `CPU`.\n"
+                    "  2. Switch quantization to `int4-weight-only` (~2.8 GB VRAM).\n"
+                    "  3. Close other GPU-heavy apps and retry."
+                ) from oom_err
+
+        return waves, native_sr, max_parallel_used
+
+    def _synthesize_long_form(
+        self,
+        *,
+        clean_text: str,
+        chunks: List[str],
+        mode: str,
+        ref_wav_path: Optional[str],
+        clean_ref_transcript: str,
+        clean_caption: str,
+        max_ref_seconds: float,
+        trim_ref_silence: bool,
+        num_steps: int,
+        cfg_scale_text: float,
+        cfg_scale_speaker: float,
+        cfg_scale_caption: float,
+        seed_used: int,
+        speed: float,
+        trim_output_silence: bool,
+        export_sample_rate: int,
+        inter_sentence_pause: float,
+        save_to_history: bool,
+        output_filename_prefix: Optional[str],
+        progress_cb: Optional[Callable[[float, str], None]],
+    ) -> SynthesisResult:
+        """
+        2-Stage Hybrid Long-Form Orchestrator (>30s Japanese scripts):
+          - Case A (`voice_design`):
+              Stage 1: Synthesize Chunk[0] alone via Text-Based Voice Design to anchor timbre.
+              Stage 2: Pass Chunk[0] waveform + clean transcript as reference into Style-Controlled
+                       Voice Cloning and run Chunks[1..N] concurrently via `synthesize_batch`.
+          - Case B (`zero_shot` / `style_clone`):
+              Run Chunks[0..N] concurrently via `synthesize_batch` against the user's reference audio.
+          - Final Stage: Seamlessly stitch chunks with `inter_sentence_pause` + 15ms crossfade.
+        """
+        from irodori_tts.inference_runtime import SamplingRequest
+
+        total_chunks = len(chunks)
+        t0 = time.perf_counter()
+        temp_files: List[Path] = []
+        chunk_waves: List[np.ndarray] = []
+        native_sr = NATIVE_SAMPLE_RATE
+
+        try:
+            if mode == "voice_design":
+                # ---------------------------------------------------------
+                # CASE A — Stage 1: Anchor speaker timbre on Chunk[0]
+                # ---------------------------------------------------------
+                if progress_cb is not None:
+                    progress_cb(0.05, f"Stage 1/2: Anchoring voice timbre on chunk 1/{total_chunks}...")
+
+                anchor_req_kwargs = self._build_filtered_kwargs(
+                    SamplingRequest,
+                    {
+                        "text": chunks[0],
+                        "ref_wav": None,
+                        "no_ref": True,
+                        "caption": clean_caption,
+                        "num_steps": int(num_steps),
+                        "cfg_scale_text": float(cfg_scale_text),
+                        "cfg_scale_speaker": 0.0,
+                        "cfg_scale_caption": float(cfg_scale_caption),
+                        "seed": seed_used,
+                        "num_candidates": 1,
+                        "decode_mode": "sequential",
+                    },
+                )
+                anchor_req = SamplingRequest(**anchor_req_kwargs)
+
+                try:
+                    with self._lock:
+                        with torch.inference_mode():
+                            anchor_raw = self._runtime.synthesize(anchor_req)
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                except torch.cuda.OutOfMemoryError as oom_err:
+                    self._clear_cuda_memory()
+                    raise TTSEngineError(
+                        "CUDA Out of Memory on Stage 1 Anchor chunk. "
+                        "Try switching to `int4-weight-only` or closing other GPU apps."
+                    ) from oom_err
+
+                anchor_wav, native_sr = self._extract_audio_and_sr(anchor_raw)
+                chunk_waves.append(anchor_wav)
+
+                # Save clean trimmed anchor reference WAV for Stage 2 style-controlled cloning
+                anchor_ref_wav = trim_silence(anchor_wav, native_sr, threshold_db=-45.0, pad_ms=60.0)
+                anchor_ref_path = self.temp_dir / f"longform_anchor_{int(time.time() * 1000)}.wav"
+                sf.write(str(anchor_ref_path), anchor_ref_wav, native_sr, subtype="PCM_16")
+                temp_files.append(anchor_ref_path)
+
+                anchor_clean_transcript = strip_prosody_emojis(chunks[0])
+                anchor_spk_cfg = float(cfg_scale_speaker) if float(cfg_scale_speaker) > 0.0 else 5.0
+
+                # ---------------------------------------------------------
+                # CASE A — Stage 2: Parallel Style-Controlled Batch (Chunks[1..N])
+                # ---------------------------------------------------------
+                stage2_reqs: List[Any] = []
+                for idx, chunk_text in enumerate(chunks[1:], start=1):
+                    req_kwargs = self._build_filtered_kwargs(
+                        SamplingRequest,
+                        {
+                            "text": chunk_text,
+                            "ref_wav": str(anchor_ref_path),
+                            "no_ref": False,
+                            "caption": clean_caption,
+                            "ref_text": anchor_clean_transcript or None,
+                            "ref_transcript": anchor_clean_transcript or None,
+                            "max_ref_seconds": float(max(15.0, min(max_ref_seconds, 30.0))),
+                            "num_steps": int(num_steps),
+                            "cfg_scale_text": float(cfg_scale_text),
+                            "cfg_scale_speaker": anchor_spk_cfg,
+                            "cfg_scale_caption": float(cfg_scale_caption),
+                            "seed": seed_used + idx,
+                            "num_candidates": 1,
+                            "decode_mode": "sequential",
+                        },
+                    )
+                    stage2_reqs.append(SamplingRequest(**req_kwargs))
+
+                rest_waves, native_sr, max_par = self._run_parallel_requests_vram_safe(
+                    stage2_reqs,
+                    progress_cb=progress_cb,
+                    progress_start=0.22,
+                    progress_end=0.92,
+                    stage_label="Stage 2/2: Parallel style-cloned batch",
+                )
+                chunk_waves.extend(rest_waves)
+                pipeline_info = (
+                    f"Long-Form Hybrid ({total_chunks} chunks: Anchor[0] + "
+                    f"Style-Clone Batch[1..{total_chunks - 1}], max_parallel={max_par})"
+                )
+            else:
+                # ---------------------------------------------------------
+                # CASE B — Zero-Shot / Style-Controlled Parallel Batch (Chunks[0..N])
+                # ---------------------------------------------------------
+                assert ref_wav_path is not None
+                processed_ref, _ = preprocess_reference_audio(
+                    Path(ref_wav_path),
+                    max_seconds=max_ref_seconds,
+                    trim_ref_silence=trim_ref_silence,
+                    target_sr=NATIVE_SAMPLE_RATE,
+                    work_dir=self.temp_dir,
+                )
+                temp_files.append(processed_ref)
+
+                batch_reqs: List[Any] = []
+                for idx, chunk_text in enumerate(chunks):
+                    req_kwargs = self._build_filtered_kwargs(
+                        SamplingRequest,
+                        {
+                            "text": chunk_text,
+                            "ref_wav": str(processed_ref),
+                            "no_ref": False,
+                            "caption": clean_caption if clean_caption else None,
+                            "ref_text": clean_ref_transcript if clean_ref_transcript else None,
+                            "ref_transcript": clean_ref_transcript if clean_ref_transcript else None,
+                            "max_ref_seconds": float(max_ref_seconds),
+                            "num_steps": int(num_steps),
+                            "cfg_scale_text": float(cfg_scale_text),
+                            "cfg_scale_speaker": float(cfg_scale_speaker),
+                            "cfg_scale_caption": float(cfg_scale_caption) if clean_caption else 0.0,
+                            "seed": seed_used + idx,
+                            "num_candidates": 1,
+                            "decode_mode": "sequential",
+                        },
+                    )
+                    batch_reqs.append(SamplingRequest(**req_kwargs))
+
+                chunk_waves, native_sr, max_par = self._run_parallel_requests_vram_safe(
+                    batch_reqs,
+                    progress_cb=progress_cb,
+                    progress_start=0.05,
+                    progress_end=0.92,
+                    stage_label="Parallel long-form batch",
+                )
+                pipeline_info = (
+                    f"Long-Form Parallel Batch ({total_chunks} chunks, max_parallel={max_par})"
+                )
+
+            # ---------------------------------------------------------
+            # Seamless Waveform Stitching + Post-Processing
+            # ---------------------------------------------------------
+            if progress_cb is not None:
+                progress_cb(0.95, f"Stitching {total_chunks} chunks (pause={inter_sentence_pause:.2f}s, 15ms crossfade)...")
+
+            audio = stitch_audio_chunks(
+                chunk_waves,
+                sr=native_sr,
+                pause_sec=float(inter_sentence_pause),
+                crossfade_ms=15.0,
+            )
+
+            elapsed_sec = time.perf_counter() - t0
+
+            if trim_output_silence:
+                audio = trim_silence(audio, native_sr, threshold_db=-42.0, pad_ms=80.0)
+            if abs(float(speed) - 1.0) >= 0.01:
+                audio = adjust_speed_wsola(audio, native_sr, float(speed))
+
+            target_sr = int(export_sample_rate) if int(export_sample_rate) in (24000, 44100, 48000) else native_sr
+            if target_sr != native_sr:
+                audio = resample_audio(audio, native_sr, target_sr)
+
+            duration_sec = float(audio.size) / float(target_sr)
+            now = datetime.now()
+            ts_file = now.strftime("%Y%m%d_%H%M%S")
+            ts_display = now.strftime("%Y-%m-%d %H:%M:%S")
+
+            prefix = output_filename_prefix or f"{ts_file}_{mode}_longform"
+            safe_prefix = re.sub(r"[^\w\-]+", "_", prefix).strip("_")
+            out_path = self.outputs_dir / f"{safe_prefix}.wav"
+            counter = 1
+            while out_path.exists():
+                out_path = self.outputs_dir / f"{safe_prefix}_{counter:02d}.wav"
+                counter += 1
+
+            sf.write(str(out_path), audio, target_sr, subtype="PCM_16")
+
+            if progress_cb is not None:
+                progress_cb(1.0, f"Done! Stitched {total_chunks} chunks ({duration_sec:.1f}s).")
+
+            result = SynthesisResult(
+                output_path=out_path,
+                sample_rate=target_sr,
+                duration_sec=duration_sec,
+                elapsed_sec=elapsed_sec,
+                mode=f"{mode}_longform",
+                text=clean_text,
+                caption=clean_caption,
+                seed_used=seed_used,
+                timestamp=ts_display,
+                num_chunks=total_chunks,
+                long_form_info=pipeline_info,
+            )
+            if save_to_history:
+                self.history.add_entry(result)
+            return result
+        finally:
+            for tmp_path in temp_files:
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except Exception:
+                        pass
+
     def synthesize(
         self,
         text: str,
@@ -958,6 +1437,9 @@ class IrodoriTTSEngine:
         export_sample_rate: int = 48000,
         save_to_history: bool = True,
         output_filename_prefix: Optional[str] = None,
+        auto_long_form: bool = True,
+        inter_sentence_pause: float = 0.30,
+        progress_cb: Optional[Callable[[float, str], None]] = None,
     ) -> SynthesisResult:
         """
         Unified synthesis entry point for:
@@ -965,6 +1447,10 @@ class IrodoriTTSEngine:
           - `voice_design`: Text-based Voice Design (no reference audio)
           - `style_clone`: Style-Controlled Voice Cloning (reference audio + caption)
           - `batch`: Single line within Batch Generation
+
+        When `auto_long_form=True` and input text exceeds the safe single-window threshold
+        (> 75 spoken chars or > 2 sentences), automatically engages the 2-Stage Hybrid
+        Long-Form pipeline (Anchor + Parallel Batch + Seamless Stitching).
         """
         clean_text = (text or "").strip()
         if not clean_text:
@@ -998,6 +1484,35 @@ class IrodoriTTSEngine:
                 "Please enter a Style / Emotion Prompt to steer the cloned voice."
             )
 
+        seed_used = int(seed) if int(seed) >= 0 else int(torch.randint(0, 2**31 - 1, (1,)).item())
+
+        # Automatically engage 2-stage long-form pipeline when enabled and script splits > 1 chunk
+        if auto_long_form and mode in ("zero_shot", "voice_design", "style_clone"):
+            chunk_plan = chunk_japanese_text(clean_text, pause_sec=inter_sentence_pause)
+            if chunk_plan.is_long_form and len(chunk_plan.chunks) > 1:
+                return self._synthesize_long_form(
+                    clean_text=clean_text,
+                    chunks=chunk_plan.chunks,
+                    mode=mode,
+                    ref_wav_path=ref_wav_path,
+                    clean_ref_transcript=clean_ref_transcript,
+                    clean_caption=clean_caption,
+                    max_ref_seconds=max_ref_seconds,
+                    trim_ref_silence=trim_ref_silence,
+                    num_steps=num_steps,
+                    cfg_scale_text=cfg_scale_text,
+                    cfg_scale_speaker=cfg_scale_speaker,
+                    cfg_scale_caption=cfg_scale_caption,
+                    seed_used=seed_used,
+                    speed=speed,
+                    trim_output_silence=trim_output_silence,
+                    export_sample_rate=export_sample_rate,
+                    inter_sentence_pause=inter_sentence_pause,
+                    save_to_history=save_to_history,
+                    output_filename_prefix=output_filename_prefix,
+                    progress_cb=progress_cb,
+                )
+
         processed_ref: Optional[Path] = None
         if not use_no_ref and ref_wav_path:
             processed_ref, _ = preprocess_reference_audio(
@@ -1007,8 +1522,6 @@ class IrodoriTTSEngine:
                 target_sr=NATIVE_SAMPLE_RATE,
                 work_dir=self.temp_dir,
             )
-
-        seed_used = int(seed) if int(seed) >= 0 else int(torch.randint(0, 2**31 - 1, (1,)).item())
 
         candidate_req: Dict[str, Any] = {
             "text": clean_text,
@@ -1094,6 +1607,8 @@ class IrodoriTTSEngine:
             caption=clean_caption,
             seed_used=seed_used,
             timestamp=ts_display,
+            num_chunks=1,
+            long_form_info="",
         )
         if save_to_history:
             self.history.add_entry(result)
